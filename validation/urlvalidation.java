@@ -8,7 +8,10 @@ import java.net.InetAddress;
 import java.net.URI;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 @Slf4j
@@ -17,14 +20,8 @@ import java.util.regex.Pattern;
 public class CallbackUrlValidator {
 
     private static final UrlValidator URL_VALIDATOR = new UrlValidator(new String[]{"https"});
-    private static final Pattern HOST_PATTERN = Pattern.compile("^[a-zA-Z0-9.-]+$");
-
-    // Строгий IPv4: 0.0.0.0 – 255.255.255.255
-    private static final Pattern IPV4_PATTERN = Pattern.compile(
-            "^(?:(?:25[0-5]|2[0-4]\\d|[01]?\\d\\d?)\\.){3}(?:25[0-5]|2[0-4]\\d|[01]?\\d\\d?)$");
-
-    // IPv6: только hex-символы и двоеточия (точная валидация — через InetAddress)
-    private static final Pattern IPV6_PATTERN = Pattern.compile("^[0-9a-fA-F:]+$");
+    // Добавлено двоеточие для IPv6 (например, ::1, 2001:db8::1)
+    private static final Pattern HOST_PATTERN = Pattern.compile("^[a-zA-Z0-9.:-]+$");
 
     private final SvcProperties svcProperties;
     private List<CidrMatcher> blacklistMatchers;
@@ -34,6 +31,12 @@ public class CallbackUrlValidator {
         this.blacklistMatchers = svcProperties.getBlacklistCidrs().stream()
                 .filter(cidr -> cidr != null && !cidr.isBlank())
                 .distinct()
+                .peek(cidr -> {
+                    // Падаем при старте, если CIDR в конфиге кривой
+                    if (!isValidCidr(cidr)) {
+                        throw new IllegalArgumentException("Invalid blacklist CIDR in config: " + cidr);
+                    }
+                })
                 .map(CidrMatcher::new)
                 .toList();
     }
@@ -61,8 +64,8 @@ public class CallbackUrlValidator {
                 return false;
             }
 
-            // Проверка localhost (строковая, без DNS)
-            if (isLocalhost(host)) {
+            if ("localhost".equalsIgnoreCase(host)
+                    || host.toLowerCase().endsWith(".localhost")) {
                 return false;
             }
 
@@ -71,46 +74,79 @@ public class CallbackUrlValidator {
                 return false;
             }
 
-            // --- ГЛАВНОЕ ИЗМЕНЕНИЕ ---
-            // Проверяем blacklist/loopback/link-local ТОЛЬКО для явных IP-литералов.
-            // Для доменов (example.com) DNS не вызывается.
-            if (isIpLiteral(host)) {
-                try {
-                    InetAddress addr = InetAddress.getByName(host); // для IP — без DNS
-                    if (addr.isLoopbackAddress()
-                            || addr.isLinkLocalAddress()
-                            || addr.isAnyLocalAddress()) {
+            // DNS lookup с таймаутом 3 секунды, чтобы не висеть вечно
+            InetAddress[] addresses = resolveWithTimeout(host, 3, TimeUnit.SECONDS);
+            List<InetAddress> uniqueAddresses = Arrays.stream(addresses)
+                    .distinct()
+                    .toList();
+
+            if (uniqueAddresses.isEmpty()) {
+                return false;
+            }
+
+            for (InetAddress ip : uniqueAddresses) {
+                if (ip.isLoopbackAddress()
+                        || ip.isLinkLocalAddress()
+                        || ip.isAnyLocalAddress()) {
+                    return false;
+                }
+
+                for (CidrMatcher matcher : blacklistMatchers) {
+                    if (matcher.matches(ip)) {
+                        // Early return: хотя бы один IP попал в blacklist → URL невалиден
                         return false;
                     }
-                    for (CidrMatcher matcher : blacklistMatchers) {
-                        if (matcher.matches(addr)) {
-                            return false;
-                        }
-                    }
-                } catch (UnknownHostException e) {
-                    log.warn("Invalid IP literal format: {}", host);
-                    return false;
                 }
             }
 
             return true;
+
+        } catch (UnknownHostException e) {
+            log.warn("DNS lookup failed for callbackUrl '{}': {}", callbackUrl, e.getMessage());
+            return false;
         } catch (Exception e) {
-            log.error("Unexpected error during validate callbackUrl: {}", e.getMessage(), e);
+            log.error("Unexpected error validating callbackUrl '{}': {}", callbackUrl, e.getMessage(), e);
             return false;
         }
     }
 
-    private boolean isLocalhost(String host) {
-        return "localhost".equalsIgnoreCase(host)
-                || host.toLowerCase().endsWith(".localhost");
+    /**
+     * InetAddress.getAllByName() блокирует поток на неопределённое время.
+     * Оборачиваем в CompletableFuture с таймаутом.
+     */
+    private InetAddress[] resolveWithTimeout(String host, long timeout, TimeUnit unit)
+            throws UnknownHostException {
+        try {
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    return InetAddress.getAllByName(host);
+                } catch (UnknownHostException e) {
+                    throw new java.util.concurrent.CompletionException(e);
+                }
+            }).orTimeout(timeout, unit).join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof UnknownHostException) {
+                throw (UnknownHostException) e.getCause();
+            }
+            throw e;
+        }
     }
 
-    private boolean isIpLiteral(String host) {
-        // IPv4 однозначно определяется регуляркой
-        if (IPV4_PATTERN.matcher(host).matches()) {
-            return true;
+    private boolean isValidCidr(String cidr) {
+        if (cidr == null || !cidr.contains("/")) {
+            return false;
         }
-        // IPv6: должны быть только hex и двоеточия (и хотя бы одно двоеточие)
-        return IPV6_PATTERN.matcher(host).matches() && host.contains(":");
+        String[] parts = cidr.split("/");
+        if (parts.length != 2) {
+            return false;
+        }
+        try {
+            int prefix = Integer.parseInt(parts[1]);
+            // IPv4: 0–32, IPv6: 0–128
+            // Если по требованиям строго /24 — добавьте: if (prefix != 24) return false;
+            return prefix >= 0 && prefix <= 128;
+        } catch (NumberFormatException e) {
+            return false;
+        }
     }
 }
