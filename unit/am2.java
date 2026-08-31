@@ -12,6 +12,7 @@ import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import feign.Feign;
 import feign.jackson.JacksonDecoder;
 import feign.jackson.JacksonEncoder;
+import feign.spring.SpringMvcContract;
 import org.junit.jupiter.api.*;
 
 import java.util.List;
@@ -40,10 +41,11 @@ class ApiManagerClientServiceWireMockTest {
     void setUp() {
         wireMock.resetAll();
 
-        // Создаем Feign клиент вручную, нацеленный на WireMock
+        // Создаем Feign клиент вручную с SpringMvcContract для поддержки @GetMapping/@PostMapping
         ApiManagerClient client = Feign.builder()
                 .encoder(new JacksonEncoder())
                 .decoder(new JacksonDecoder())
+                .contract(new SpringMvcContract())  // <-- поддержка Spring MVC аннотаций
                 .errorDecoder(new ApiManagerErrorDecoder(new ObjectMapper()))
                 .target(ApiManagerClient.class, "http://localhost:" + wireMock.port());
 

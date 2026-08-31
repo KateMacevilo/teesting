@@ -1,6 +1,5 @@
 package com.example.consent.wiremock;
 
-import com.example.consent.dto.IdentityResponse;
 import com.example.consent.exception.OBException;
 import com.example.consent.feign.IdentityClient;
 import com.example.consent.properties.IdentityServerProperties;
@@ -11,6 +10,7 @@ import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
 import feign.Feign;
 import feign.jackson.JacksonDecoder;
 import feign.jackson.JacksonEncoder;
+import feign.spring.SpringMvcContract;
 import org.junit.jupiter.api.*;
 
 import java.util.Map;
@@ -42,6 +42,7 @@ class IdentityClientServiceWireMockTest {
         IdentityClient client = Feign.builder()
                 .encoder(new JacksonEncoder())
                 .decoder(new JacksonDecoder())
+                .contract(new SpringMvcContract())  // <-- поддержка @GetMapping и т.д.
                 .errorDecoder(new IdentityCarbonErrorDecoder(new ObjectMapper()))
                 .target(IdentityClient.class, "http://localhost:" + wireMock.port());
 
@@ -63,7 +64,6 @@ class IdentityClientServiceWireMockTest {
                 "KEY_TYPE", "API_KEY"
         );
 
-        // Ожидаемое имя: sub-001_app-uuid-123_API_KEY
         wireMock.stubFor(get(urlPathEqualTo("/authorized-apps/" + userId))
                 .withHeader("Authorization", containing("Basic"))
                 .willReturn(aResponse()
@@ -134,8 +134,3 @@ class IdentityClientServiceWireMockTest {
                 .isInstanceOf(OBException.class);
     }
 }
-
-
-//testImplementation 'org.springframework.boot:spring-boot-starter-test'
-//        testImplementation 'com.github.tomakehurst:wiremock-jre8:2.35.0'
-//        testImplementation 'io.github.openfeign:feign-jackson:12.3'
