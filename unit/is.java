@@ -1,98 +1,90 @@
-package com.example.consent.wiremock;
+package com.example.consent.unit;
 
+import com.example.consent.dto.IdentityResponse;
 import com.example.consent.exception.OBException;
 import com.example.consent.feign.IdentityClient;
 import com.example.consent.properties.IdentityServerProperties;
 import com.example.consent.service.IdentityClientService;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.tomakehurst.wiremock.WireMockServer;
-import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
-import feign.Feign;
-import feign.jackson.JacksonDecoder;
-import feign.jackson.JacksonEncoder;
-import feign.spring.SpringMvcContract;
-import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.Base64;
+import java.util.List;
 import java.util.Map;
 
-import static com.github.tomakehurst.wiremock.client.WireMock.*;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.*;
 
-class IdentityClientServiceWireMockTest {
+@ExtendWith(MockitoExtension.class)
+class IdentityClientServiceUnitTest {
 
-    private static WireMockServer wireMock;
-    private IdentityClientService service;
+    @Mock
+    private IdentityClient identityClient;
 
-    @BeforeAll
-    static void startWireMock() {
-        wireMock = new WireMockServer(WireMockConfiguration.wireMockConfig().dynamicPort());
-        wireMock.start();
-    }
+    @Mock
+    private IdentityServerProperties identityProperties;
 
-    @AfterAll
-    static void stopWireMock() {
-        wireMock.stop();
-    }
+    @InjectMocks
+    private IdentityClientService identityClientService;
+
+    private static final String USER_ID = "user-123";
+    private static final String USERNAME = "test-user";
+    private static final String PASSWORD = "test-pass";
 
     @BeforeEach
     void setUp() {
-        wireMock.resetAll();
-
-        IdentityClient client = Feign.builder()
-                .encoder(new JacksonEncoder())
-                .decoder(new JacksonDecoder())
-                .contract(new SpringMvcContract())  // <-- поддержка @GetMapping и т.д.
-                .errorDecoder(new IdentityCarbonErrorDecoder(new ObjectMapper()))
-                .target(IdentityClient.class, "http://localhost:" + wireMock.port());
-
-        IdentityServerProperties props = new IdentityServerProperties();
-        props.setAuth(new IdentityServerProperties.Auth());
-        props.getAuth().setUsername("test");
-        props.getAuth().setPassword("test");
-
-        service = new IdentityClientService(client, props);
+        IdentityServerProperties.Auth auth = new IdentityServerProperties.Auth();
+        auth.setUsername(USERNAME);
+        auth.setPassword(PASSWORD);
+        when(identityProperties.getAuth()).thenReturn(auth);
     }
 
-    @Test
-    @DisplayName("Успешный поиск authorized app по совпадению имени")
-    void getAuthorizedApps_success() {
-        String userId = "user-123";
-        Map<String, String> claims = Map.of(
+    private Map<String, String> buildClaims() {
+        return Map.of(
                 "SUBSCRIBER", "sub-001",
                 "APPLICATION_UUID", "app-uuid-123",
                 "KEY_TYPE", "API_KEY"
         );
+    }
 
-        wireMock.stubFor(get(urlPathEqualTo("/authorized-apps/" + userId))
-                .withHeader("Authorization", containing("Basic"))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/json")
-                        .withBody("[{\"name\":\"sub-001_app-uuid-123_API_KEY\",\"clientId\":\"client-abc-123\"}]")));
+    private String expectedBasicAuth() {
+        return "Basic " + Base64.getEncoder().encodeToString((USERNAME + ":" + PASSWORD).getBytes());
+    }
 
-        String result = service.getAuthorizedApps(userId, claims);
+    @Test
+    @DisplayName("getAuthorizedApps: находит clientId по совпадению имени")
+    void getAuthorizedApps_success() {
+        String expectedName = "sub-001_app-uuid-123_API_KEY";
+        IdentityResponse response = new IdentityResponse();
+        response.setName(expectedName);
+        response.setClientId("client-abc-123");
+
+        when(identityClient.getAuthorizedApps(USER_ID, expectedBasicAuth()))
+                .thenReturn(List.of(response));
+
+        String result = identityClientService.getAuthorizedApps(USER_ID, buildClaims());
 
         assertThat(result).isEqualTo("client-abc-123");
+        verify(identityClient).getAuthorizedApps(USER_ID, expectedBasicAuth());
     }
 
     @Test
-    @DisplayName("Client not found -> OBException 400")
-    void getAuthorizedApps_clientNotFound_throwsOBException() {
-        String userId = "user-123";
-        Map<String, String> claims = Map.of(
-                "SUBSCRIBER", "sub-001",
-                "APPLICATION_UUID", "app-uuid-123",
-                "KEY_TYPE", "API_KEY"
-        );
+    @DisplayName("getAuthorizedApps: client not found -> OBException 400")
+    void getAuthorizedApps_clientNotFound_throwsOBException400() {
+        IdentityResponse response = new IdentityResponse();
+        response.setName("other-name");
+        response.setClientId("other-id");
 
-        wireMock.stubFor(get(urlPathEqualTo("/authorized-apps/" + userId))
-                .willReturn(aResponse()
-                        .withStatus(200)
-                        .withHeader("Content-Type", "application/json")
-                        .withBody("[{\"name\":\"other-name\",\"clientId\":\"other-id\"}]")));
+        when(identityClient.getAuthorizedApps(USER_ID, expectedBasicAuth()))
+                .thenReturn(List.of(response));
 
-        assertThatThrownBy(() -> service.getAuthorizedApps(userId, claims))
+        assertThatThrownBy(() -> identityClientService.getAuthorizedApps(USER_ID, buildClaims()))
                 .isInstanceOf(OBException.class)
                 .satisfies(ex -> {
                     OBException ob = (OBException) ex;
@@ -101,36 +93,71 @@ class IdentityClientServiceWireMockTest {
     }
 
     @Test
-    @DisplayName("401 Unauthorized -> RetryableException (для @Retryable)")
-    void getAuthorizedApps_401_returnsRetryableException() {
-        wireMock.stubFor(get(urlPathMatching("/authorized-apps/.*"))
-                .willReturn(aResponse().withStatus(401)));
+    @DisplayName("getAuthorizedApps: пустой список от IS -> OBException 400")
+    void getAuthorizedApps_emptyList_throwsOBException400() {
+        when(identityClient.getAuthorizedApps(USER_ID, expectedBasicAuth()))
+                .thenReturn(List.of());
 
-        assertThatThrownBy(() -> service.getAuthorizedApps("user-123", Map.of()))
-                .isInstanceOf(RetryableException.class);
-    }
-
-    @Test
-    @DisplayName("500 с телом ошибки -> Wso2Exception")
-    void getAuthorizedApps_500_withBody_returnsWso2Exception() {
-        wireMock.stubFor(get(urlPathMatching("/authorized-apps/.*"))
-                .willReturn(aResponse()
-                        .withStatus(500)
-                        .withHeader("Content-Type", "application/json")
-                        .withBody("{\"message\":\"IS error\",\"description\":\"DB connection lost\"}")));
-
-        assertThatThrownBy(() -> service.getAuthorizedApps("user-123", Map.of()))
-                .isInstanceOf(Wso2Exception.class)
-                .hasMessageContaining("DB connection lost");
-    }
-
-    @Test
-    @DisplayName("500 с пустым телом -> OBException 500")
-    void getAuthorizedApps_500_emptyBody_returnsOBException() {
-        wireMock.stubFor(get(urlPathMatching("/authorized-apps/.*"))
-                .willReturn(aResponse().withStatus(500)));
-
-        assertThatThrownBy(() -> service.getAuthorizedApps("user-123", Map.of()))
+        assertThatThrownBy(() -> identityClientService.getAuthorizedApps(USER_ID, buildClaims()))
                 .isInstanceOf(OBException.class);
+    }
+
+    @Test
+    @DisplayName("getAuthorizedApps: SuiteException 4xx -> OBException 500")
+    void getAuthorizedApps_suiteException4xx_throwsOBException500() {
+        SuiteException suiteEx = mock(SuiteException.class);
+        SuiteError suiteError = mock(SuiteError.class);
+        Status status = mock(Status.class);
+
+        when(suiteEx.getSuiteError()).thenReturn(suiteError);
+        when(suiteError.getStatus()).thenReturn(status);
+        when(status.getStatusCode()).thenReturn(404); // 4xx
+
+        when(identityClient.getAuthorizedApps(any(), any())).thenThrow(suiteEx);
+
+        assertThatThrownBy(() -> identityClientService.getAuthorizedApps(USER_ID, buildClaims()))
+                .isInstanceOf(OBException.class)
+                .satisfies(ex -> {
+                    OBException ob = (OBException) ex;
+                    assertThat(ob.getStatusCode()).isEqualTo(500);
+                });
+    }
+
+    @Test
+    @DisplayName("getAuthorizedApps: SuiteException 5xx -> пробрасывает SuiteException")
+    void getAuthorizedApps_suiteException5xx_rethrows() {
+        SuiteException suiteEx = mock(SuiteException.class);
+        SuiteError suiteError = mock(SuiteError.class);
+        Status status = mock(Status.class);
+
+        when(suiteEx.getSuiteError()).thenReturn(suiteError);
+        when(suiteError.getStatus()).thenReturn(status);
+        when(status.getStatusCode()).thenReturn(503); // 5xx
+
+        when(identityClient.getAuthorizedApps(any(), any())).thenThrow(suiteEx);
+
+        assertThatThrownBy(() -> identityClientService.getAuthorizedApps(USER_ID, buildClaims()))
+                .isInstanceOf(SuiteException.class);
+    }
+
+    @Test
+    @DisplayName("getAuthorizedApps: generic Exception -> SuiteException")
+    void getAuthorizedApps_genericException_throwsSuiteException() {
+        when(identityClient.getAuthorizedApps(any(), any()))
+                .thenThrow(new RuntimeException("connection timeout"));
+
+        assertThatThrownBy(() -> identityClientService.getAuthorizedApps(USER_ID, buildClaims()))
+                .isInstanceOf(SuiteException.class)
+                .hasMessageContaining("connection timeout");
+    }
+
+    @Test
+    @DisplayName("getAuthorizedApps: OBException из identityClient -> пробрасывает как есть")
+    void getAuthorizedApps_obException_rethrows() {
+        OBException obEx = new OBException(403, "Forbidden");
+        when(identityClient.getAuthorizedApps(any(), any())).thenThrow(obEx);
+
+        assertThatThrownBy(() -> identityClientService.getAuthorizedApps(USER_ID, buildClaims()))
+                .isSameAs(obEx);
     }
 }
